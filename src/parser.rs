@@ -789,12 +789,16 @@ fn char_string(s: &str) -> IResult<&str, &str> {
     let (s, _) = quote(s)?;
     
     // Try to parse a normal escaped string first
-    if let Ok((remaining, content)) = opt(escaped(take_till1(is_quote_or_escape_character), '\\', one_of(r#""n\"#)))(s) {
-        if let Some(content) = content {
-            // Check if we have a proper closing quote
-            if let Ok((remaining, _)) = quote(remaining) {
-                return Ok((remaining, content));
-            }
+    let (s, optional_char_string_value) = opt(escaped(
+        take_till1(is_quote_or_escape_character), 
+        '\\', 
+        one_of(r#""n\"#)
+    ))(s)?;
+    
+    if let Some(content) = optional_char_string_value {
+        // Check if we have a proper closing quote
+        if let Ok((remaining, _)) = quote(s) {
+            return Ok((remaining, content));
         }
     }
     
