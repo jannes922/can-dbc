@@ -5,9 +5,11 @@
 use std::{collections::HashMap, str};
 
 use nom::{
-    branch::{alt, permutation},
-    bytes::complete::{tag, take_till, take_while, take_while1},
-    character::complete::{self, char, line_ending, multispace0, space0, space1},
+    branch::alt, // Removed permutation
+    bytes::complete::{escaped, tag, take_till, take_till1, take_while, take_while1},
+    character::complete::{
+        self, char, line_ending, multispace0, one_of, space0, space1,
+    },
     combinator::{map, opt, value},
     error::{ErrorKind, ParseError},
     multi::{many0, many_till, separated_list0},
@@ -15,16 +17,16 @@ use nom::{
     sequence::preceded,
     AsChar, IResult, InputTakeAtPosition,
 };
-use nom::bytes::complete::{escaped, take_till1};
-use nom::character::complete::one_of;
+// use nom::bytes::complete::{escaped, take_till1}; // Already imported above
+// use nom::character::complete::one_of; // Already imported above
 use crate::{
     AccessNode, AccessType, AttributeDefault, AttributeDefinition, AttributeValue,
-    AttributeValueForObject, AttributeValueType, AttributeValuedForObjectType, Baudrate, ByteOrder,
-    Comment, EnvType, EnvironmentVariable, EnvironmentVariableData, ExtendedMultiplex,
-    ExtendedMultiplexMapping, Message, MessageId, MessageTransmitter, MultiplexIndicator, Node,
-    Signal, SignalExtendedValueType, SignalExtendedValueTypeList, SignalGroups, SignalType,
-    SignalTypeRef, Symbol, Transmitter, ValDescription, ValueDescription, ValueTable, ValueType,
-    Version, DBC,
+    AttributeValueForObject, AttributeValueType, AttributeValuedForObjectType, Baudrate,
+    ByteOrder, Comment, EnvType, EnvironmentVariable, EnvironmentVariableData,
+    ExtendedMultiplex, ExtendedMultiplexMapping, Message, MessageId, MessageTransmitter,
+    MultiplexIndicator, Node, Signal, SignalExtendedValueType,
+    SignalExtendedValueTypeList, SignalGroups, SignalType, SignalTypeRef, Symbol,
+    Transmitter, ValDescription, ValueDescription, ValueTable, ValueType, Version, DBC,
 };
 
 #[cfg(test)]
@@ -678,6 +680,40 @@ mod tests {
         let (_, extended_message_id) = message_id(&s).unwrap();
         assert_eq!(extended_message_id, MessageId::Extended(0x1FFFFFFF));
     }
+
+    #[test]
+    fn mf15_gesamtfahrzeug_test() {
+        let dbc_content = std::fs::read_to_string("MF15_Gesamtfahrzeug.dbc")
+            .expect("Failed to read MF15_Gesamtfahrzeug.dbc file");
+
+        println!("DBC file length: {} characters", dbc_content.len());
+
+        let result = dbc(&dbc_content);
+        match result {
+            Ok((remaining, parsed_dbc)) => {
+                println!(
+                    "Successfully parsed {} messages",
+                    parsed_dbc.messages().len()
+                );
+                println!("Remaining content length: {}", remaining.len());
+                if !remaining.trim().is_empty() {
+                    println!(
+                        "Remaining content (first 200 chars): {}",
+                        remaining.chars().take(200).collect::<String>()
+                    );
+                }
+                assert!(!parsed_dbc.messages().is_empty(), "No messages were parsed");
+                assert!(
+                    remaining.trim().is_empty(),
+                    "Parser did not consume the entire file. Remaining (first 200 chars): '{}'",
+                    remaining.chars().take(200).collect::<String>()
+                );
+            }
+            Err(e) => {
+                panic!("Failed to parse DBC file: {:?}", e);
+            }
+        }
+    }
 }
 
 fn is_semi_colon(chr: char) -> bool {
@@ -782,33 +818,34 @@ fn c_ident(s: &str) -> IResult<&str, String> {
 }
 
 fn c_ident_vec(s: &str) -> IResult<&str, Vec<String>> {
-    separated_list0(comma, c_ident)(s)
+    separated_list0(preceded(space0, preceded(comma, space0)), c_ident)(s)
 }
 
 fn char_string(s: &str) -> IResult<&str, &str> {
-    let (s, _) = quote(s)?;
-    
-    // Try to parse a normal escaped string first
-    let (s, optional_char_string_value) = opt(escaped(
-        take_till1(is_quote_or_escape_character), 
-        '\\', 
-        one_of(r#""n\"#)
-    ))(s)?;
-    
+    let (s_after_opening_quote, _) = quote(s)?;
+
+    let (s_after_escaped_opt, optional_char_string_value) = opt(escaped(
+        take_till1(is_quote_or_escape_character),
+        '\\',
+        one_of("\"n\\"),
+    ))(s_after_opening_quote)?;
+
     if let Some(content) = optional_char_string_value {
-        // Check if we have a proper closing quote
-        if let Ok((remaining, _)) = quote(s) {
-            return Ok((remaining, content));
+        if let Ok((remaining_after_closing_quote, _)) = quote(s_after_escaped_opt) {
+            return Ok((remaining_after_closing_quote, content));
         }
     }
-    
-    // If normal parsing fails, try to handle malformed strings by taking everything until newline or quote
-    let (s, content) = take_till(|c| c == '"' || c == '\n' || c == '\r')(s)?;
-    
-    // Try to consume the closing quote if it exists, otherwise just continue
-    let (s, _) = opt(quote)(s)?;
-    
-    Ok((s, content))
+
+    let input_for_fallback = if optional_char_string_value.is_some() {
+        s_after_escaped_opt
+    } else {
+        s_after_opening_quote
+    };
+
+    let (s_for_fallback_opt_quote, content_fallback) =
+        take_till(|c| c == '"' || c == '\n' || c == '\r')(input_for_fallback)?;
+    let (s_after_fallback, _) = opt(quote)(s_for_fallback_opt_quote)?;
+    Ok((s_after_fallback, content_fallback))
 }
 
 fn little_endian(s: &str) -> IResult<&str, ByteOrder> {
@@ -846,44 +883,49 @@ fn value_type(s: &str) -> IResult<&str, ValueType> {
 }
 
 fn multiplexer(s: &str) -> IResult<&str, MultiplexIndicator> {
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = char('m')(s)?;
     let (s, d) = complete::u64(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     Ok((s, MultiplexIndicator::MultiplexedSignal(d)))
 }
 
 fn multiplexor(s: &str) -> IResult<&str, MultiplexIndicator> {
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = char('M')(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     Ok((s, MultiplexIndicator::Multiplexor))
 }
 
 fn multiplexor_and_multiplexed(s: &str) -> IResult<&str, MultiplexIndicator> {
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = char('m')(s)?;
     let (s, d) = complete::u64(s)?;
     let (s, _) = char('M')(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     Ok((s, MultiplexIndicator::MultiplexorAndMultiplexedSignal(d)))
 }
 
 fn plain(s: &str) -> IResult<&str, MultiplexIndicator> {
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     Ok((s, MultiplexIndicator::Plain))
 }
 
 fn multiplexer_indicator(s: &str) -> IResult<&str, MultiplexIndicator> {
-    alt((multiplexer, multiplexor, multiplexor_and_multiplexed, plain))(s)
+    alt((
+        multiplexor_and_multiplexed,
+        multiplexer,
+        multiplexor,
+        plain,
+    ))(s)
 }
 
 fn version(s: &str) -> IResult<&str, Version> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("VERSION")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, v) = char_string(s)?;
-    let (s, _) = line_ending(s)?;
+    let (s, _) = opt(line_ending)(s)?;
     Ok((s, Version(v.to_string())))
 }
 
@@ -891,41 +933,45 @@ fn bit_timing(s: &str) -> IResult<&str, Vec<Baudrate>> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("BS_:")(s)?;
     let (s, baudrates) = opt(preceded(
-        ms1,
-        separated_list0(comma, map(complete::u64, Baudrate)),
+        space1,
+        separated_list0(
+            preceded(space0, preceded(comma, space0)),
+            map(complete::u64, Baudrate),
+        ),
     ))(s)?;
+    let (s, _) = opt(line_ending)(s)?;
     Ok((s, baudrates.unwrap_or_default()))
 }
 
 fn signal(s: &str) -> IResult<&str, Signal> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("SG_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, name) = c_ident(s)?;
     let (s, multiplexer_indicator) = multiplexer_indicator(s)?;
-    let (s, _) = colon(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = preceded(space0, colon)(s)?;
+    let (s, _) = space1(s)?;
     let (s, start_bit) = complete::u64(s)?;
     let (s, _) = pipe(s)?;
     let (s, signal_size) = complete::u64(s)?;
     let (s, _) = at(s)?;
     let (s, byte_order) = byte_order(s)?;
     let (s, value_type) = value_type(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = brc_open(s)?;
     let (s, factor) = double(s)?;
-    let (s, _) = comma(s)?;
-    let (s, offset) = double(s)?;
+    let (s, _) = preceded(space0, comma)(s)?;
+    let (s, offset) = preceded(space0, double)(s)?;
     let (s, _) = brc_close(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = brk_open(s)?;
     let (s, min) = double(s)?;
-    let (s, _) = pipe(s)?;
-    let (s, max) = double(s)?;
+    let (s, _) = preceded(space0, pipe)(s)?;
+    let (s, max) = preceded(space0, double)(s)?;
     let (s, _) = brk_close(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, unit) = char_string(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, receivers) = c_ident_vec(s)?;
     let (s, _) = line_ending(s)?;
     Ok((
@@ -950,14 +996,14 @@ fn signal(s: &str) -> IResult<&str, Signal> {
 fn message(s: &str) -> IResult<&str, Message> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("BO_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_id) = message_id(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_name) = c_ident(s)?;
-    let (s, _) = colon(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = preceded(space0, colon)(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_size) = complete::u64(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, transmitter) = transmitter(s)?;
     let (s, signals) = many0(signal)(s)?;
     Ok((
@@ -975,11 +1021,11 @@ fn message(s: &str) -> IResult<&str, Message> {
 fn attribute_default(s: &str) -> IResult<&str, AttributeDefault> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("BA_DEF_DEF_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, attribute_name) = char_string(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, attribute_value) = attribute_value(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
 
     Ok((
@@ -993,9 +1039,9 @@ fn attribute_default(s: &str) -> IResult<&str, AttributeDefault> {
 
 fn node_comment(s: &str) -> IResult<&str, Comment> {
     let (s, _) = tag("BU_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, node_name) = c_ident(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, comment) = char_string(s)?;
 
     Ok((
@@ -1009,9 +1055,9 @@ fn node_comment(s: &str) -> IResult<&str, Comment> {
 
 fn message_comment(s: &str) -> IResult<&str, Comment> {
     let (s, _) = tag("BO_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_id) = message_id(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, comment) = char_string(s)?;
 
     Ok((
@@ -1025,11 +1071,11 @@ fn message_comment(s: &str) -> IResult<&str, Comment> {
 
 fn signal_comment(s: &str) -> IResult<&str, Comment> {
     let (s, _) = tag("SG_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_id) = message_id(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, signal_name) = c_ident(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, comment) = char_string(s)?;
     Ok((
         s,
@@ -1042,11 +1088,11 @@ fn signal_comment(s: &str) -> IResult<&str, Comment> {
 }
 
 fn env_var_comment(s: &str) -> IResult<&str, Comment> {
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     let (s, _) = tag("EV_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, env_var_name) = c_ident(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, comment) = char_string(s)?;
     Ok((
         s,
@@ -1070,7 +1116,7 @@ fn comment_plain(s: &str) -> IResult<&str, Comment> {
 fn comment(s: &str) -> IResult<&str, Comment> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("CM_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, comment) = alt((
         node_comment,
         message_comment,
@@ -1078,14 +1124,14 @@ fn comment(s: &str) -> IResult<&str, Comment> {
         signal_comment,
         comment_plain,
     ))(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
     Ok((s, comment))
 }
 
 fn value_description(s: &str) -> IResult<&str, ValDescription> {
     let (s, a) = double(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, b) = char_string(s)?;
     Ok((
         s,
@@ -1097,15 +1143,15 @@ fn value_description(s: &str) -> IResult<&str, ValDescription> {
 }
 
 fn value_description_for_signal(s: &str) -> IResult<&str, ValueDescription> {
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     let (s, _) = tag("VAL_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_id) = message_id(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, signal_name) = c_ident(s)?;
     let (s, value_descriptions) = many_till(
-        preceded(ms1, value_description),
-        preceded(opt(ms1), semi_colon),
+        preceded(space1, value_description),
+        preceded(opt(space1), semi_colon),
     )(s)?;
     Ok((
         s,
@@ -1118,13 +1164,13 @@ fn value_description_for_signal(s: &str) -> IResult<&str, ValueDescription> {
 }
 
 fn value_description_for_env_var(s: &str) -> IResult<&str, ValueDescription> {
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     let (s, _) = tag("VAL_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, env_var_name) = c_ident(s)?;
     let (s, value_descriptions) = many_till(
-        preceded(ms1, value_description),
-        preceded(opt(ms1), semi_colon),
+        preceded(space1, value_description),
+        preceded(opt(space1), semi_colon),
     )(s)?;
     Ok((
         s,
@@ -1200,28 +1246,29 @@ fn access_node(s: &str) -> IResult<&str, AccessNode> {
 fn environment_variable(s: &str) -> IResult<&str, EnvironmentVariable> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("EV_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, env_var_name) = c_ident(s)?;
-    let (s, _) = colon(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = preceded(space0, colon)(s)?;
+    let (s, _) = space1(s)?;
     let (s, env_var_type) = env_var_type(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = brk_open(s)?;
     let (s, min) = complete::i64(s)?;
-    let (s, _) = pipe(s)?;
-    let (s, max) = complete::i64(s)?;
+    let (s, _) = preceded(space0, pipe)(s)?;
+    let (s, max) = preceded(space0, complete::i64)(s)?;
     let (s, _) = brk_close(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, unit) = char_string(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, initial_value) = double(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, ev_id) = complete::i64(s)?;
-    let (s, _) = ms1(s)?;
-    let (s, access_type) = access_type(s)?;
-    let (s, _) = ms1(s)?;
-    let (s, access_nodes) = separated_list0(comma, access_node)(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = space1(s)?;
+    let (s, access_type_val) = access_type(s)?;
+    let (s, _) = space1(s)?;
+    let (s, access_nodes) =
+        separated_list0(preceded(space0, preceded(comma, space0)), access_node)(s)?;
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
     Ok((
         s,
@@ -1233,7 +1280,7 @@ fn environment_variable(s: &str) -> IResult<&str, EnvironmentVariable> {
             unit: unit.to_string(),
             initial_value,
             ev_id,
-            access_type,
+            access_type: access_type_val,
             access_nodes,
         },
     ))
@@ -1242,12 +1289,12 @@ fn environment_variable(s: &str) -> IResult<&str, EnvironmentVariable> {
 fn environment_variable_data(s: &str) -> IResult<&str, EnvironmentVariableData> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("ENVVAR_DATA_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, env_var_name) = c_ident(s)?;
-    let (s, _) = colon(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = preceded(space0, colon)(s)?;
+    let (s, _) = space1(s)?;
     let (s, data_size) = complete::u64(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
     Ok((
         s,
@@ -1261,48 +1308,48 @@ fn environment_variable_data(s: &str) -> IResult<&str, EnvironmentVariableData> 
 fn signal_type(s: &str) -> IResult<&str, SignalType> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("SGTYPE_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, signal_type_name) = c_ident(s)?;
-    let (s, _) = colon(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = preceded(space0, colon)(s)?;
+    let (s, _) = space1(s)?;
     let (s, signal_size) = complete::u64(s)?;
     let (s, _) = at(s)?;
-    let (s, byte_order) = byte_order(s)?;
-    let (s, value_type) = value_type(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, byte_order_val) = byte_order(s)?;
+    let (s, value_type_val) = value_type(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = brc_open(s)?;
     let (s, factor) = double(s)?;
-    let (s, _) = comma(s)?;
-    let (s, offset) = double(s)?;
+    let (s, _) = preceded(space0, comma)(s)?;
+    let (s, offset) = preceded(space0, double)(s)?;
     let (s, _) = brc_close(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = brk_open(s)?;
     let (s, min) = double(s)?;
-    let (s, _) = pipe(s)?;
-    let (s, max) = double(s)?;
+    let (s, _) = preceded(space0, pipe)(s)?;
+    let (s, max) = preceded(space0, double)(s)?;
     let (s, _) = brk_close(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, unit) = char_string(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, default_value) = double(s)?;
-    let (s, _) = ms1(s)?;
-    let (s, value_table) = c_ident(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = space1(s)?;
+    let (s, value_table_name) = c_ident(s)?;
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
     Ok((
         s,
         SignalType {
             signal_type_name,
             signal_size,
-            byte_order,
-            value_type,
+            byte_order: byte_order_val,
+            value_type: value_type_val,
             factor,
             offset,
             min,
             max,
             unit: unit.to_string(),
             default_value,
-            value_table,
+            value_table: value_table_name,
         },
     ))
 }
@@ -1328,19 +1375,14 @@ fn attribute_value_charstr(s: &str) -> IResult<&str, AttributeValue> {
 }
 
 fn attribute_value(s: &str) -> IResult<&str, AttributeValue> {
-    alt((
-        // attribute_value_uint64,
-        // attribute_value_int64,
-        attribute_value_f64,
-        attribute_value_charstr,
-    ))(s)
+    alt((attribute_value_f64, attribute_value_charstr))(s)
 }
 
 fn network_node_attribute_value(s: &str) -> IResult<&str, AttributeValuedForObjectType> {
     let (s, _) = tag("BU_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, node_name) = c_ident(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, value) = attribute_value(s)?;
     Ok((
         s,
@@ -1350,9 +1392,9 @@ fn network_node_attribute_value(s: &str) -> IResult<&str, AttributeValuedForObje
 
 fn message_definition_attribute_value(s: &str) -> IResult<&str, AttributeValuedForObjectType> {
     let (s, _) = tag("BO_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_id) = message_id(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, value) = opt(attribute_value)(s)?;
     Ok((
         s,
@@ -1362,11 +1404,11 @@ fn message_definition_attribute_value(s: &str) -> IResult<&str, AttributeValuedF
 
 fn signal_attribute_value(s: &str) -> IResult<&str, AttributeValuedForObjectType> {
     let (s, _) = tag("SG_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_id) = message_id(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, signal_name) = c_ident(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, value) = attribute_value(s)?;
     Ok((
         s,
@@ -1376,9 +1418,9 @@ fn signal_attribute_value(s: &str) -> IResult<&str, AttributeValuedForObjectType
 
 fn env_variable_attribute_value(s: &str) -> IResult<&str, AttributeValuedForObjectType> {
     let (s, _) = tag("EV_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, env_var_name) = c_ident(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, value) = attribute_value(s)?;
     Ok((
         s,
@@ -1396,9 +1438,9 @@ fn raw_attribute_value(s: &str) -> IResult<&str, AttributeValuedForObjectType> {
 fn attribute_value_for_object(s: &str) -> IResult<&str, AttributeValueForObject> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("BA_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, attribute_name) = char_string(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, attribute_value) = alt((
         network_node_attribute_value,
         message_definition_attribute_value,
@@ -1406,7 +1448,7 @@ fn attribute_value_for_object(s: &str) -> IResult<&str, AttributeValueForObject>
         env_variable_attribute_value,
         raw_attribute_value,
     ))(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
     Ok((
         s,
@@ -1419,30 +1461,27 @@ fn attribute_value_for_object(s: &str) -> IResult<&str, AttributeValueForObject>
 
 fn attribute_definition_node(s: &str) -> IResult<&str, AttributeDefinition> {
     let (s, _) = tag("BU_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, name) = char_string(s)?;
-
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     let (s, val) = attribute_value_type(s)?;
     Ok((s, AttributeDefinition::Node(name.to_string(), val)))
 }
 
 fn attribute_definition_signal(s: &str) -> IResult<&str, AttributeDefinition> {
     let (s, _) = tag("SG_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, name) = char_string(s)?;
-
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     let (s, val) = attribute_value_type(s)?;
     Ok((s, AttributeDefinition::Signal(name.to_string(), val)))
 }
 
 fn attribute_definition_environment_variable(s: &str) -> IResult<&str, AttributeDefinition> {
     let (s, _) = tag("EV_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, name) = char_string(s)?;
-
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     let (s, val) = attribute_value_type(s)?;
     Ok((
         s,
@@ -1452,16 +1491,16 @@ fn attribute_definition_environment_variable(s: &str) -> IResult<&str, Attribute
 
 fn attribute_definition_message(s: &str) -> IResult<&str, AttributeDefinition> {
     let (s, _) = tag("BO_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, name) = char_string(s)?;
-
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     let (s, val) = attribute_value_type(s)?;
     Ok((s, AttributeDefinition::Message(name.to_string(), val)))
 }
 
 fn attribute_definition_plain(s: &str) -> IResult<&str, AttributeDefinition> {
     let (s, name) = char_string(s)?;
+    let (s, _) = space0(s)?;
     let (s, val) = attribute_value_type(s)?;
     Ok((s, AttributeDefinition::Plain(name.to_string(), val)))
 }
@@ -1469,24 +1508,22 @@ fn attribute_definition_plain(s: &str) -> IResult<&str, AttributeDefinition> {
 fn attribute_value_type_int(s: &str) -> IResult<&str, AttributeValueType> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("INT")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, first) = complete::i64(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, second) = complete::i64(s)?;
-
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     Ok((s, AttributeValueType::AttributeValueTypeInt(first, second)))
 }
 
 fn attribute_value_type_float(s: &str) -> IResult<&str, AttributeValueType> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("FLOAT")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, first) = double(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, second) = double(s)?;
-
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     Ok((
         s,
         AttributeValueType::AttributeValueTypeFloat(first, second),
@@ -1496,24 +1533,22 @@ fn attribute_value_type_float(s: &str) -> IResult<&str, AttributeValueType> {
 fn attribute_value_type_hex(s: &str) -> IResult<&str, AttributeValueType> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("HEX")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, first) = complete::i64(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, second) = complete::i64(s)?;
-
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     Ok((s, AttributeValueType::AttributeValueTypeHex(first, second)))
 }
 
 fn attribute_value_type_string(s: &str) -> IResult<&str, AttributeValueType> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("STRING")(s)?;
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     Ok((s, AttributeValueType::AttributeValueTypeString))
 }
 
 fn attribute_value_type(s: &str) -> IResult<&str, AttributeValueType> {
-    let (s, _) = multispace0(s)?;
     let (s, val) = alt((
         attribute_value_type_int,
         attribute_value_type_hex,
@@ -1521,38 +1556,38 @@ fn attribute_value_type(s: &str) -> IResult<&str, AttributeValueType> {
         attribute_value_type_string,
         attribute_value_type_enum,
     ))(s)?;
-
     Ok((s, val))
 }
 
 fn comma_seperated_char_string(s: &str) -> IResult<&str, String> {
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     let (s, _) = comma(s)?;
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     let (s, c_s) = char_string(s)?;
     Ok((s, c_s.to_string()))
 }
 fn attribute_value_type_enum(s: &str) -> IResult<&str, AttributeValueType> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("ENUM")(s)?;
-    let (s, _) = ms0(s)?;
+    let (mut s, _) = space0(s)?; // `s` will be updated by subsequent parsers
     let mut buffer: Vec<String> = vec![];
 
-    if let (s, Some(value)) = opt(char_string)(s)? {
+    if let (s_after_first_val, Some(value)) = opt(char_string)(s)? {
         buffer.push(value.to_string());
-        let (s, mut tail) = many0(comma_seperated_char_string)(s)?;
+        let (s_after_tail, mut tail) = many0(comma_seperated_char_string)(s_after_first_val)?;
         buffer.append(&mut tail);
-        Ok((s, AttributeValueType::AttributeValueTypeEnum(buffer)))
+        s = s_after_tail; // Update s to the remainder after parsing tail
     } else {
-        let (s, _) = ms0(s)?;
-        Ok((s, AttributeValueType::AttributeValueTypeEnum(buffer)))
+        // s remains as is if no initial char_string was parsed
     }
+    let (s, _) = space0(s)?;
+    Ok((s, AttributeValueType::AttributeValueTypeEnum(buffer)))
 }
 
 fn attribute_definition(s: &str) -> IResult<&str, AttributeDefinition> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("BA_DEF_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, def) = alt((
         attribute_definition_node,
         attribute_definition_signal,
@@ -1560,16 +1595,16 @@ fn attribute_definition(s: &str) -> IResult<&str, AttributeDefinition> {
         attribute_definition_message,
         attribute_definition_plain,
     ))(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
     Ok((s, def))
 }
 
 fn symbol(s: &str) -> IResult<&str, Symbol> {
     let (s, _) = space1(s)?;
-    let (s, symbol) = c_ident(s)?;
+    let (s, symbol_text) = c_ident(s)?;
     let (s, _) = line_ending(s)?;
-    Ok((s, Symbol(symbol)))
+    Ok((s, Symbol(symbol_text)))
 }
 
 fn new_symbols(s: &str) -> IResult<&str, Vec<Symbol>> {
@@ -1585,7 +1620,10 @@ fn new_symbols(s: &str) -> IResult<&str, Vec<Symbol>> {
 fn node(s: &str) -> IResult<&str, Node> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("BU_:")(s)?;
-    let (s, li) = opt(preceded(ms1, separated_list0(ms1, c_ident)))(s)?;
+    let (s, li) = opt(preceded(
+        space1,
+        separated_list0(space1, c_ident),
+    ))(s)?;
     let (s, _) = space0(s)?;
     let (s, _) = line_ending(s)?;
     Ok((s, Node(li.unwrap_or_default())))
@@ -1594,15 +1632,15 @@ fn node(s: &str) -> IResult<&str, Node> {
 fn signal_type_ref(s: &str) -> IResult<&str, SignalTypeRef> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("SGTYPE_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_id) = message_id(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, signal_name) = c_ident(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = colon(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, signal_type_name) = c_ident(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
     Ok((
         s,
@@ -1617,25 +1655,27 @@ fn signal_type_ref(s: &str) -> IResult<&str, SignalTypeRef> {
 fn value_table(s: &str) -> IResult<&str, ValueTable> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("VAL_TABLE_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, value_table_name) = c_ident(s)?;
-    let (s, value_descriptions) =
-        many_till(preceded(ms0, value_description), preceded(ms0, semi_colon))(s)?;
+    let (s, value_descriptions_list) = many_till(
+        preceded(space1, value_description),
+        preceded(space0, semi_colon),
+    )(s)?;
     let (s, _) = line_ending(s)?;
     Ok((
         s,
         ValueTable {
             value_table_name,
-            value_descriptions: value_descriptions.0,
+            value_descriptions: value_descriptions_list.0,
         },
     ))
 }
 
 fn extended_multiplex_mapping(s: &str) -> IResult<&str, ExtendedMultiplexMapping> {
-    let (s, _) = ms0(s)?;
+    let (s, _) = space0(s)?;
     let (s, min_value) = complete::u64(s)?;
-    let (s, _) = char('-')(s)?;
-    let (s, max_value) = complete::u64(s)?;
+    let (s, _) = preceded(space0, char('-'))(s)?;
+    let (s, max_value) = preceded(space0, complete::u64)(s)?;
     Ok((
         s,
         ExtendedMultiplexMapping {
@@ -1648,15 +1688,16 @@ fn extended_multiplex_mapping(s: &str) -> IResult<&str, ExtendedMultiplexMapping
 fn extended_multiplex(s: &str) -> IResult<&str, ExtendedMultiplex> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("SG_MUL_VAL_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_id) = message_id(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, signal_name) = c_ident(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, multiplexor_signal_name) = c_ident(s)?;
-    let (s, _) = ms1(s)?;
-    let (s, mappings) = separated_list0(tag(","), extended_multiplex_mapping)(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = space1(s)?;
+    let (s, mappings) =
+        separated_list0(preceded(space0, tag(",")), extended_multiplex_mapping)(s)?;
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
     Ok((
         s,
@@ -1690,22 +1731,22 @@ fn signal_extended_value_type(s: &str) -> IResult<&str, SignalExtendedValueType>
 fn signal_extended_value_type_list(s: &str) -> IResult<&str, SignalExtendedValueTypeList> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("SIG_VALTYPE_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_id) = message_id(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, signal_name) = c_ident(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = opt(colon)(s)?;
-    let (s, _) = ms1(s)?;
-    let (s, signal_extended_value_type) = signal_extended_value_type(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = space1(s)?;
+    let (s, sig_ext_val_type) = signal_extended_value_type(s)?;
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
     Ok((
         s,
         SignalExtendedValueTypeList {
             message_id,
             signal_name,
-            signal_extended_value_type,
+            signal_extended_value_type: sig_ext_val_type,
         },
     ))
 }
@@ -1723,25 +1764,25 @@ fn transmitter(s: &str) -> IResult<&str, Transmitter> {
 }
 
 fn message_transmitters(s: &str) -> IResult<&str, Vec<Transmitter>> {
-    separated_list0(comma, transmitter)(s)
+    separated_list0(preceded(space0, preceded(comma, space0)), transmitter)(s)
 }
 
 fn message_transmitter(s: &str) -> IResult<&str, MessageTransmitter> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("BO_TX_BU_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_id) = message_id(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = colon(s)?;
-    let (s, _) = ms1(s)?;
-    let (s, transmitter) = message_transmitters(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = space1(s)?;
+    let (s, transmitter_list) = message_transmitters(s)?;
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
     Ok((
         s,
         MessageTransmitter {
             message_id,
-            transmitter,
+            transmitter: transmitter_list,
         },
     ))
 }
@@ -1749,17 +1790,17 @@ fn message_transmitter(s: &str) -> IResult<&str, MessageTransmitter> {
 fn signal_groups(s: &str) -> IResult<&str, SignalGroups> {
     let (s, _) = multispace0(s)?;
     let (s, _) = tag("SIG_GROUP_")(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, message_id) = message_id(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, signal_group_name) = c_ident(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, repetitions) = complete::u64(s)?;
-    let (s, _) = ms1(s)?;
+    let (s, _) = space1(s)?;
     let (s, _) = colon(s)?;
-    let (s, _) = ms1(s)?;
-    let (s, signal_names) = separated_list0(ms1, c_ident)(s)?;
-    let (s, _) = semi_colon(s)?;
+    let (s, _) = space1(s)?;
+    let (s, signal_names) = separated_list0(space1, c_ident)(s)?; // Propagate error with ?
+    let (s, _) = preceded(space0, semi_colon)(s)?;
     let (s, _) = line_ending(s)?;
     Ok((
         s,
@@ -1801,74 +1842,219 @@ fn deduplicate_value_description_names(
     value_descriptions
 }
 
-pub fn dbc(s: &str) -> IResult<&str, DBC> {
-    let (
-        s,
-        (
-            version,
-            new_symbols,
-            bit_timing,
-            nodes,
-            value_tables,
-            messages,
-            message_transmitters,
-            environment_variables,
-            environment_variable_data,
-            signal_types,
-            comments,
-            attribute_definitions,
-            attribute_defaults,
-            attribute_values,
-            value_descriptions,
-            signal_type_refs,
-            signal_groups,
-            signal_extended_value_type_list,
-            extended_multiplex,
-        ),
-    ) = permutation((
-        version,
-        new_symbols,
-        opt(bit_timing),
-        many0(node),
-        many0(value_table),
-        many0(message),
-        many0(message_transmitter),
-        many0(environment_variable),
-        many0(environment_variable_data),
-        many0(signal_type),
-        many0(comment),
-        many0(attribute_definition),
-        many0(attribute_default),
-        many0(attribute_value_for_object),
-        many0(value_descriptions),
-        many0(signal_type_ref),
-        many0(signal_groups),
-        many0(signal_extended_value_type_list),
-        many0(extended_multiplex),
-    ))(s)?;
-    let (s, _) = multispace0(s)?;
+pub fn dbc(mut s: &str) -> IResult<&str, DBC> {
+    let (remaining_after_version, version_val) = version(s)?;
+    let (remaining_after_symbols, new_symbols_vec) = new_symbols(remaining_after_version)?;
+    let (remaining_after_bit_timing_opt, bit_timing_opt) =
+        opt(bit_timing)(remaining_after_symbols)?;
+    s = remaining_after_bit_timing_opt;
+
+    let mut nodes = Vec::new();
+    let mut value_tables = Vec::new();
+    let mut messages = Vec::new();
+    let mut message_transmitters_list = Vec::new();
+    let mut environment_variables_list = Vec::new();
+    let mut environment_variable_data_list = Vec::new();
+    let mut signal_types_list = Vec::new();
+    let mut comments_list = Vec::new();
+    let mut attribute_definitions_list = Vec::new();
+    let mut attribute_defaults_list = Vec::new();
+    let mut attribute_values_list = Vec::new();
+    let mut value_descriptions_list = Vec::new();
+    let mut signal_type_refs_list = Vec::new();
+    let mut signal_groups_list = Vec::new();
+    let mut signal_extended_value_type_list_vec = Vec::new();
+    let mut extended_multiplex_list = Vec::new();
+
+    loop {
+        let (input_for_iteration, _) = multispace0(s)?;
+
+        if input_for_iteration.is_empty() {
+            s = input_for_iteration;
+            break;
+        }
+
+        let s_before_section_parsers = input_for_iteration;
+        let original_s_len = s_before_section_parsers.len();
+        let mut matched_this_iteration = false;
+
+        if let Ok((remaining, val)) = node(s_before_section_parsers) {
+            if remaining.len() < original_s_len {
+                nodes.push(val);
+                s = remaining;
+                matched_this_iteration = true;
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = value_table(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    value_tables.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = message(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    messages.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = message_transmitter(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    message_transmitters_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = environment_variable(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    environment_variables_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = environment_variable_data(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    environment_variable_data_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = signal_type(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    signal_types_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = comment(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    comments_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = attribute_definition(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    attribute_definitions_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = attribute_default(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    attribute_defaults_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = attribute_value_for_object(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    attribute_values_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = value_descriptions(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    value_descriptions_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = signal_type_ref(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    signal_type_refs_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = signal_groups(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    signal_groups_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) =
+                signal_extended_value_type_list(s_before_section_parsers)
+            {
+                if remaining.len() < original_s_len {
+                    signal_extended_value_type_list_vec.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+        if !matched_this_iteration {
+            if let Ok((remaining, val)) = extended_multiplex(s_before_section_parsers) {
+                if remaining.len() < original_s_len {
+                    extended_multiplex_list.push(val);
+                    s = remaining;
+                    matched_this_iteration = true;
+                }
+            }
+        }
+
+        if !matched_this_iteration {
+            s = s_before_section_parsers; // Restore s if no parser matched or consumed input
+            break;
+        }
+    }
+
+    let (final_remaining, _) = multispace0(s)?;
+
     Ok((
-        s,
+        final_remaining,
         DBC {
-            version,
-            new_symbols,
-            bit_timing,
+            version: version_val,
+            new_symbols: new_symbols_vec,
+            bit_timing: bit_timing_opt, // Corrected: pass the Option directly
             nodes,
             value_tables,
             messages,
-            message_transmitters,
-            environment_variables,
-            environment_variable_data,
-            signal_types,
-            comments,
-            attribute_definitions,
-            attribute_defaults,
-            attribute_values,
-            value_descriptions: deduplicate_value_description_names(value_descriptions),
-            signal_type_refs,
-            signal_groups,
-            signal_extended_value_type_list,
-            extended_multiplex,
+            message_transmitters: message_transmitters_list,
+            environment_variables: environment_variables_list,
+            environment_variable_data: environment_variable_data_list,
+            signal_types: signal_types_list,
+            comments: comments_list,
+            attribute_definitions: attribute_definitions_list,
+            attribute_defaults: attribute_defaults_list,
+            attribute_values: attribute_values_list,
+            value_descriptions: deduplicate_value_description_names(
+                value_descriptions_list,
+            ),
+            signal_type_refs: signal_type_refs_list,
+            signal_groups: signal_groups_list,
+            signal_extended_value_type_list: signal_extended_value_type_list_vec,
+            extended_multiplex: extended_multiplex_list,
         },
     ))
 }

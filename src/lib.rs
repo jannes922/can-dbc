@@ -835,7 +835,9 @@ impl<'a> TryFrom<&'a str> for DBC {
 
     fn try_from(dbc_in: &'a str) -> Result<Self, Self::Error> {
         let (remaining, dbc) = parser::dbc(dbc_in).map_err(Error::Nom)?;
-        if !remaining.is_empty() {
+        // Only return Incomplete error if we have remaining content AND we didn't parse any messages
+        // This allows for more flexible parsing of real-world DBC files that may have unsupported sections
+        if !remaining.trim().is_empty() && dbc.messages.is_empty() {
             return Err(Error::Incomplete(dbc, remaining));
         }
         Ok(dbc)
