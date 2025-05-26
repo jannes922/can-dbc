@@ -693,7 +693,7 @@ fn is_c_ident_head(chr: char) -> bool {
 }
 
 fn is_quote_or_escape_character(chr: char) -> bool {
-    chr == '"' || chr == '\\'
+    chr == '"' || chr == '\\' || chr == '\n' || chr == '\r'
 }
 
 /// Multispace zero or more
@@ -787,11 +787,24 @@ fn c_ident_vec(s: &str) -> IResult<&str, Vec<String>> {
 
 fn char_string(s: &str) -> IResult<&str, &str> {
     let (s, _) = quote(s)?;
-    let (s, optional_char_string_value) =  opt(escaped(take_till1(is_quote_or_escape_character), '\\', one_of(r#""n\"#)))(s)?;
-    let (s, _) = quote(s)?;
-
-    let char_string_value = optional_char_string_value.unwrap_or("");
-    Ok((s, char_string_value))
+    
+    // Try to parse a normal escaped string first
+    if let Ok((remaining, content)) = opt(escaped(take_till1(is_quote_or_escape_character), '\\', one_of(r#""n\"#)))(s) {
+        if let Some(content) = content {
+            // Check if we have a proper closing quote
+            if let Ok((remaining, _)) = quote(remaining) {
+                return Ok((remaining, content));
+            }
+        }
+    }
+    
+    // If normal parsing fails, try to handle malformed strings by taking everything until newline or quote
+    let (s, content) = take_till(|c| c == '"' || c == '\n' || c == '\r')(s)?;
+    
+    // Try to consume the closing quote if it exists, otherwise just continue
+    let (s, _) = opt(quote)(s)?;
+    
+    Ok((s, content))
 }
 
 fn little_endian(s: &str) -> IResult<&str, ByteOrder> {
