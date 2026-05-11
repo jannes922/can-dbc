@@ -402,10 +402,77 @@ pub(crate) fn dbc(buffer: &str) -> DbcResult<Dbc> {
         attribute_values_message,
         attribute_values_signal,
         attribute_values_env,
-        value_descriptions,
+        value_descriptions: deduplicate_value_description_names(value_descriptions),
         signal_type_refs: vec![], // TODO
         signal_groups,
         signal_extended_value_type_list,
         extended_multiplex,
     })
+}
+
+/// Deduplicate signal names in value descriptions by appending a counter.
+///
+/// Some DBC files contain duplicate `VAL_` entries for the same signal name.
+/// This function renames duplicates so each entry has a unique name.
+fn deduplicate_value_description_names(
+    mut value_descriptions: Vec<ValueDescription>,
+) -> Vec<ValueDescription> {
+    let mut name_count = std::collections::HashMap::<String, i32>::new();
+
+    for desc in &mut value_descriptions {
+        if let ValueDescription::Signal { name: signal_name, .. } = desc {
+            let count = name_count.entry(signal_name.clone()).or_default();
+            *count += 1;
+            if *count > 1 {
+                *signal_name = format!("{signal_name}{count}");
+            }
+        }
+    }
+
+    value_descriptions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deduplicate_value_description_names_test() {
+        let input = vec![
+            ValueDescription::Signal {
+                message_id: MessageId::Standard(1),
+                name: "Speed".to_string(),
+                value_descriptions: vec![ValDescription {
+                    id: 0,
+                    description: "Off".to_string(),
+                }],
+            },
+            ValueDescription::Signal {
+                message_id: MessageId::Standard(2),
+                name: "Speed".to_string(),
+                value_descriptions: vec![ValDescription {
+                    id: 1,
+                    description: "On".to_string(),
+                }],
+            },
+            ValueDescription::Signal {
+                message_id: MessageId::Standard(3),
+                name: "Speed".to_string(),
+                value_descriptions: vec![ValDescription {
+                    id: 2,
+                    description: "Auto".to_string(),
+                }],
+            },
+        ];
+
+        let result = deduplicate_value_description_names(input);
+        let names: Vec<String> = result
+            .iter()
+            .map(|vd| match vd {
+                ValueDescription::Signal { name, .. } => name.clone(),
+                ValueDescription::EnvironmentVariable { .. } => panic!("unexpected env var"),
+            })
+            .collect();
+        assert_eq!(names, vec!["Speed", "Speed2", "Speed3"]);
+    }
 }

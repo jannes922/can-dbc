@@ -27,6 +27,7 @@ with-serde = ["serde"]
 [dependencies]
 can-dbc-pest = "0.7.2"
 encoding_rs = { version = "0.8", optional = true }
+num = { version = "0.4", default-features = false }
 serde = { version = "1.0", features = ["derive"], optional = true }
 thiserror = "2.0.17"
 

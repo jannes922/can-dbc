@@ -1,10 +1,12 @@
 #![doc = include_str!("../README.md")]
 
 mod ast;
+mod extend;
 mod parser;
 
 // Re-export all types from the ast module
 pub use ast::*;
+pub use extend::*;
 // Re-export of `encoding_rs` as encodings to simplify usage
 #[cfg(feature = "encodings")]
 pub use encoding_rs as encodings;
